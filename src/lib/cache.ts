@@ -1,5 +1,5 @@
-import { basename, join } from 'path';
-import { mkdir, readFile, writeFile, stat } from 'fs/promises';
+import { basename, join } from "path";
+import { mkdir, readFile, writeFile, stat } from "fs/promises";
 
 export interface CacheOptions {
   cacheDir: string;
@@ -23,24 +23,27 @@ export class FileCache {
 
   private getCachePath(key: string): string {
     // Simple hash-based filename
-    const hash = Array.from(key).reduce((a, b) => ((a << 5) - a + b.charCodeAt(0)) | 0, 0);
+    const hash = Array.from(key).reduce(
+      (a, b) => ((a << 5) - a + b.charCodeAt(0)) | 0,
+      0,
+    );
     return join(this.cacheDir, `${Math.abs(hash)}.json`);
   }
 
   async get<T>(key: string): Promise<T | null> {
     const path = this.getCachePath(key);
-    
+
     try {
-      const content = await readFile(path, 'utf-8');
+      const content = await readFile(path, "utf-8");
       const entry: CacheEntry<T> = JSON.parse(content);
-      
+
       // Check expiration
       if (this.ttlMs && entry.expiresAt) {
         if (new Date(entry.expiresAt) < new Date()) {
           return null;
         }
       }
-      
+
       return entry.data;
     } catch {
       return null;
@@ -50,15 +53,17 @@ export class FileCache {
   async set<T>(key: string, data: T): Promise<void> {
     const path = this.getCachePath(key);
     const now = new Date();
-    
+
     const entry: CacheEntry<T> = {
       data,
       cachedAt: now.toISOString(),
-      expiresAt: this.ttlMs ? new Date(now.getTime() + this.ttlMs).toISOString() : undefined,
+      expiresAt: this.ttlMs
+        ? new Date(now.getTime() + this.ttlMs).toISOString()
+        : undefined,
     };
 
     await mkdir(this.cacheDir, { recursive: true });
-    await writeFile(path, JSON.stringify(entry, null, 2), 'utf-8');
+    await writeFile(path, JSON.stringify(entry, null, 2), "utf-8");
   }
 
   async has(key: string): Promise<boolean> {
@@ -69,7 +74,7 @@ export class FileCache {
   async delete(key: string): Promise<void> {
     const path = this.getCachePath(key);
     try {
-      const { unlink } = await import('fs/promises');
+      const { unlink } = await import("fs/promises");
       await unlink(path);
     } catch {
       // Ignore if doesn't exist
@@ -78,27 +83,31 @@ export class FileCache {
 
   async clear(): Promise<void> {
     try {
-      const { readdir, unlink } = await import('fs/promises');
+      const { readdir, unlink } = await import("fs/promises");
       const files = await readdir(this.cacheDir);
-      await Promise.all(files.map(f => unlink(join(this.cacheDir, f))));
+      await Promise.all(files.map((f) => unlink(join(this.cacheDir, f))));
     } catch {
       // Ignore if directory doesn't exist
     }
   }
 
-  async getStats(): Promise<{ size: number; oldest?: string; newest?: string }> {
+  async getStats(): Promise<{
+    size: number;
+    oldest?: string;
+    newest?: string;
+  }> {
     try {
-      const { readdir } = await import('fs/promises');
+      const { readdir } = await import("fs/promises");
       const files = await readdir(this.cacheDir);
-      
+
       let oldest: string | undefined;
       let newest: string | undefined;
 
       for (const file of files) {
         const path = join(this.cacheDir, file);
-        const content = await readFile(path, 'utf-8');
+        const content = await readFile(path, "utf-8");
         const entry = JSON.parse(content);
-        
+
         if (!oldest || entry.cachedAt < oldest) oldest = entry.cachedAt;
         if (!newest || entry.cachedAt > newest) newest = entry.cachedAt;
       }

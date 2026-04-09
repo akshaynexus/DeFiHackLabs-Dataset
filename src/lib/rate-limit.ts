@@ -22,7 +22,7 @@ export class TokenBucket {
     const now = Date.now();
     const elapsed = now - this.lastRefill;
     const tokensToAdd = Math.floor(elapsed / this.refillIntervalMs);
-    
+
     if (tokensToAdd > 0) {
       this.tokens = Math.min(this.maxTokens, this.tokens + tokensToAdd);
       this.lastRefill = now;
@@ -31,13 +31,14 @@ export class TokenBucket {
 
   async acquire(tokens = 1): Promise<void> {
     this.refill();
-    
+
     while (this.tokens < tokens) {
-      const waitTime = (this.refillIntervalMs * (tokens - this.tokens)) / this.refillRate;
-      await new Promise(resolve => setTimeout(resolve, waitTime));
+      const waitTime =
+        (this.refillIntervalMs * (tokens - this.tokens)) / this.refillRate;
+      await new Promise((resolve) => setTimeout(resolve, waitTime));
       this.refill();
     }
-    
+
     this.tokens -= tokens;
   }
 
@@ -80,4 +81,7 @@ export class MultiRateLimiter {
   }
 }
 
-export const defaultRateLimiter = new MultiRateLimiter({ rps: 5, maxBurst: 10 });
+export const defaultRateLimiter = new MultiRateLimiter({
+  rps: 5,
+  maxBurst: 10,
+});

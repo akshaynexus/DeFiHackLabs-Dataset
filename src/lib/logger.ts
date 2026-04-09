@@ -1,4 +1,4 @@
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogEntry {
   timestamp: string;
@@ -10,7 +10,7 @@ export interface LogEntry {
 
 class Logger {
   private logs: LogEntry[] = [];
-  private minLevel: LogLevel = 'info';
+  private minLevel: LogLevel = "info";
   private levels: Record<LogLevel, number> = {
     debug: 0,
     info: 1,
@@ -18,7 +18,7 @@ class Logger {
     error: 3,
   };
 
-  constructor(minLevel: LogLevel = 'info') {
+  constructor(minLevel: LogLevel = "info") {
     this.minLevel = minLevel;
   }
 
@@ -26,9 +26,14 @@ class Logger {
     return this.levels[level] >= this.levels[this.minLevel];
   }
 
-  private log(level: LogLevel, message: string, context?: Record<string, unknown>, error?: string) {
+  private log(
+    level: LogLevel,
+    message: string,
+    context?: Record<string, unknown>,
+    error?: string,
+  ) {
     if (!this.shouldLog(level)) return;
-    
+
     const entry: LogEntry = {
       timestamp: new Date().toISOString(),
       level,
@@ -36,9 +41,9 @@ class Logger {
       context,
       error,
     };
-    
+
     this.logs.push(entry);
-    
+
     const prefix = `[${entry.timestamp}] [${level.toUpperCase()}]`;
     if (error) {
       console.error(`${prefix} ${message}`, context, error);
@@ -50,19 +55,19 @@ class Logger {
   }
 
   debug(message: string, context?: Record<string, unknown>) {
-    this.log('debug', message, context);
+    this.log("debug", message, context);
   }
 
   info(message: string, context?: Record<string, unknown>) {
-    this.log('info', message, context);
+    this.log("info", message, context);
   }
 
   warn(message: string, context?: Record<string, unknown>) {
-    this.log('warn', message, context);
+    this.log("warn", message, context);
   }
 
   error(message: string, error?: string, context?: Record<string, unknown>) {
-    this.log('error', message, context, error);
+    this.log("error", message, context, error);
   }
 
   getLogs(): LogEntry[] {

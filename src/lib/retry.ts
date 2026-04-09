@@ -15,7 +15,7 @@ const defaultRetryOptions: RetryOptions = {
 
 export async function retry<T>(
   fn: () => Promise<T>,
-  options: Partial<RetryOptions> = {}
+  options: Partial<RetryOptions> = {},
 ): Promise<T> {
   const opts = { ...defaultRetryOptions, ...options };
   let lastError: Error | undefined;
@@ -26,23 +26,24 @@ export async function retry<T>(
       return await fn();
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      
+
       if (attempt === opts.maxAttempts) {
         break;
       }
 
       // Check if error is retryable
       const errorMessage = lastError.message.toLowerCase();
-      const isRetryable = opts.retryableErrors?.some(e => 
-        errorMessage.includes(e.toLowerCase())
-      ) ?? true; // Default: retry all
+      const isRetryable =
+        opts.retryableErrors?.some((e) =>
+          errorMessage.includes(e.toLowerCase()),
+        ) ?? true; // Default: retry all
 
       if (!isRetryable) {
         throw lastError;
       }
 
       // Wait with exponential backoff
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await new Promise((resolve) => setTimeout(resolve, delay));
       delay = Math.min(delay * opts.backoffMultiplier, opts.maxDelayMs);
     }
   }
@@ -57,14 +58,14 @@ export interface AsyncRetryOptions<T> extends RetryOptions {
 
 export async function asyncRetry<T>(
   fn: () => Promise<T>,
-  options: Partial<AsyncRetryOptions<T>> = {}
+  options: Partial<AsyncRetryOptions<T>> = {},
 ): Promise<T> {
   const opts: AsyncRetryOptions<T> = {
     ...defaultRetryOptions,
     shouldRetry: () => true,
     ...options,
   };
-  
+
   let lastError: Error | undefined;
   let delay = opts.initialDelayMs;
 
@@ -73,7 +74,7 @@ export async function asyncRetry<T>(
       return await fn();
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      
+
       if (attempt === opts.maxAttempts) {
         break;
       }
@@ -87,7 +88,7 @@ export async function asyncRetry<T>(
         await opts.onRetry(lastError, attempt);
       }
 
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await new Promise((resolve) => setTimeout(resolve, delay));
       delay = Math.min(delay * opts.backoffMultiplier, opts.maxDelayMs);
     }
   }

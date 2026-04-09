@@ -1,76 +1,80 @@
-import { createPOCParser } from '../services/poc-parser';
-import { createTargetResolver } from '../services/target-resolver';
-import { createContractFetcher, type ContractFetcher } from '../services/contract-fetcher';
-import { createDatasetWriter, computeIdempotencyKey, type DatasetWriter } from '../services/dataset-writer';
-import { createEtherscanClient } from '../clients/etherscan-client';
-import { createOpenRouterClient, type OpenRouterClient, parseFoundryChains, type ChainContext } from '../clients/openrouter-client';
-import { createLogger } from '../lib/logger';
-import { FileCache } from '../lib/cache';
-import { config, validateConfig } from '../config/env';
-import { getChainConfig } from '../domain/chain';
-import { readFile } from 'fs/promises';
-import type { DatasetRecord } from '../domain/vulnerability';
+import { createPOCParser } from "../services/poc-parser";
+import { createTargetResolver } from "../services/target-resolver";
+import {
+  createContractFetcher,
+  type ContractFetcher,
+} from "../services/contract-fetcher";
+import {
+  createDatasetWriter,
+  computeIdempotencyKey,
+  type DatasetWriter,
+} from "../services/dataset-writer";
+import { createEtherscanClient } from "../clients/etherscan-client";
+import {
+  createAIClient,
+  parseFoundryChains,
+  type ChainContext,
+  type AIClient,
+} from "../clients/ai-client";
+import { createLogger } from "../lib/logger";
+import { FileCache } from "../lib/cache";
+import { config, validateConfig } from "../config/env";
+import { readFile } from "fs/promises";
+import type { DatasetRecord } from "../domain/vulnerability";
 
-const logger = createLogger('info');
+const logger = createLogger("info");
 
 interface PipelineContext {
   parser: ReturnType<typeof createPOCParser>;
   resolver: ReturnType<typeof createTargetResolver>;
   fetcher: ContractFetcher;
   writer: DatasetWriter;
-  aiClient: OpenRouterClient;
+  aiClient: AIClient;
   etherscanClient: ReturnType<typeof createEtherscanClient>;
   foundryChains: ChainContext[];
 }
 
 async function loadFoundryChains(inputDir: string): Promise<ChainContext[]> {
   try {
-    const foundryPath = inputDir.replace('/src/test', '/foundry.toml');
-    const content = await readFile(foundryPath, 'utf-8');
-    const chains = parseFoundryChains(content);
-    logger.info(`Loaded ${chains.length} chains from foundry.toml`);
-    return chains;
+    const foundryPath = inputDir.replace("/src/test", "/foundry.toml");
+    const content = await readFile(foundryPath, "utf-8");
+    return parseFoundryChains(content);
   } catch {
-    logger.warn('No foundry.toml found, using default Ethereum');
-    return [{
-      chain_id: 1,
-      chain_name: 'mainnet',
-      rpc_url: '',
-      source: 'default',
-    }];
+    logger.warn("No foundry.toml found");
+    return [];
   }
 }
 
 async function initializePipeline(): Promise<PipelineContext> {
-  logger.info('Initializing pipeline...');
+  logger.info("Initializing pipeline...");
 
-  // Validate config
   const validation = validateConfig();
   if (!validation.valid) {
-    logger.error('Invalid config', validation.errors.join(', '));
+    logger.error("Invalid config", validation.errors.join(", "));
     process.exit(1);
   }
 
-  // Load foundry chains
   const foundryChains = await loadFoundryChains(config.input_dir);
+  logger.info(`Loaded ${foundryChains.length} chains from foundry.toml`);
 
-  // Initialize components
   const parser = createPOCParser();
   const resolver = createTargetResolver();
-  
+
   const cache = new FileCache({
-    cacheDir: config.cache_dir + '/contracts',
+    cacheDir: config.cache_dir + "/contracts",
     ttlSeconds: config.cache_ttl_seconds,
   });
 
-  const etherscanClient = createEtherscanClient(config.etherscan_api_key, config.etherscan_tier);
+  const etherscanClient = createEtherscanClient(
+    config.etherscan_api_key,
+    config.etherscan_tier,
+  );
   const fetcher = createContractFetcher({
     etherscanClient: etherscanClient as any,
     cache,
     config,
   });
-
-  const aiClient = createOpenRouterClient(config);
+  const aiClient = createAIClient();
 
   const writer = createDatasetWriter({
     outputDir: config.output_dir,
@@ -81,44 +85,51 @@ async function initializePipeline(): Promise<PipelineContext> {
   await writer.initialize();
 
   logger.info(`Etherscan tier: ${config.etherscan_tier}`);
-  if (config.etherscan_tier === 'free') {
-    logger.info('Free tier - skipping non-Ethereum mainnet chains');
-  }
-
   if (aiClient.isEnabled()) {
-    logger.info(`AI enabled. Extraction: ${aiClient.getCheapModel()}, Analysis: ${aiClient.getMainModel()}`);
+    logger.info(
+      `AI enabled: extraction=${aiClient.getExtractionModel()}, analysis=${aiClient.getAnalysisModel()}`,
+    );
   }
 
-  logger.info('Pipeline initialized');
-
-  return { parser, resolver, fetcher, writer, aiClient, etherscanClient, foundryChains };
+  return {
+    parser,
+    resolver,
+    fetcher,
+    writer,
+    aiClient,
+    etherscanClient,
+    foundryChains,
+  };
 }
 
 async function processPOC(
   ctx: PipelineContext,
-  filePath: string
+  filePath: string,
 ): Promise<DatasetRecord | null> {
   const startTime = Date.now();
 
   try {
-    // Step 1: Parse POC
-    logger.debug(`Parsing ${filePath}`);
+    // Step 1: Parse POC to get raw code
     const parsed = await ctx.parser.parsePOCFile(filePath);
 
     // Check idempotency
-    const idempotencyKey = computeIdempotencyKey(parsed.code, ctx.parser.getVersion(), config);
+    const idempotencyKey = computeIdempotencyKey(
+      parsed.code,
+      ctx.parser.getVersion(),
+      config,
+    );
     const alreadyProcessed = await ctx.writer.hasIdempotencyKey(idempotencyKey);
-    
-    if (alreadyProcessed && config.idempotency_strategy === 'skip') {
+
+    if (alreadyProcessed && config.idempotency_strategy === "skip") {
       logger.info(`Skipping ${parsed.id} (already processed)`);
       return null;
     }
 
-    // Step 1.5: AI extraction with foundry chain context
+    // Step 2: AI Extract - identify vulnerable contracts from POC code + foundry chains
     let aiExtraction: {
       vulnerable_contracts: Array<{
         address: string;
-        role: 'vulnerable' | 'attacker' | 'helper';
+        role: "vulnerable" | "attacker" | "helper";
         chain_id: number;
         reason: string;
       }>;
@@ -128,166 +139,233 @@ async function processPOC(
     } | null = null;
 
     if (ctx.aiClient.isEnabled()) {
-      logger.debug(`AI extracting contracts for ${parsed.id}`);
-      aiExtraction = await ctx.aiClient.extractContractInfo(parsed, ctx.foundryChains);
-      
-      if (aiExtraction) {
-        logger.debug(`AI extracted: ${aiExtraction.vulnerable_contracts.length} contracts, type: ${aiExtraction.vulnerability_type}`);
-      }
-    }
-
-    // Step 2: Resolve targets (use AI extraction if available)
-    const resolved = ctx.resolver.resolveTargets(parsed, aiExtraction?.vulnerable_contracts ?? null);
-
-    // Skip POCs on unsupported chains for free tier
-    const unsupportedChains = resolved.contracts
-      .map(c => c.chain_id)
-      .filter(chainId => !ctx.etherscanClient.isChainSupported(chainId));
-    
-    if (unsupportedChains.length > 0 && config.etherscan_tier === 'free') {
-      logger.info(`Skipping ${parsed.id} - uses unsupported chains for free tier: ${[...new Set(unsupportedChains)].join(', ')}`);
-      return null;
-    }
-
-    // Step 3: Fetch contracts
-    const contracts = await ctx.fetcher.fetchContracts(resolved.contracts);
-
-    // Step 4: Determine resolution status
-    const status = ctx.fetcher.determineResolutionStatus(contracts);
-
-    // Build evidence array
-    const evidence: string[] = [];
-    for (const c of contracts) {
-      if (c.is_verified) {
-        evidence.push(`verified: ${c.address}`);
-      } else if (c.fetch_error) {
-        evidence.push(`failed: ${c.address} (${c.fetch_error})`);
-      } else {
-        evidence.push(`unverified: ${c.address}`);
-      }
-    }
-
-    // Step 5: AI analysis with foundry context, proxy info, and extraction context
-    let aiAnalysis = null;
-    if (ctx.aiClient.isEnabled() && status === 'resolved') {
-      logger.debug(`AI analyzing ${parsed.id}`);
-      aiAnalysis = await ctx.aiClient.analyzeExploit(
+      aiExtraction = await ctx.aiClient.extractContractInfo(
         parsed,
-        contracts,
-        aiExtraction ? {
-          attack_summary: aiExtraction.attack_summary,
-          vulnerability_type: aiExtraction.vulnerability_type,
-          root_cause: aiExtraction.root_cause,
-        } : null,
-        ctx.foundryChains
+        ctx.foundryChains,
+      );
+      if (!aiExtraction || !aiExtraction.vulnerable_contracts || aiExtraction.vulnerable_contracts.length === 0) {
+        logger.error(`AI extraction returned no contracts for ${parsed.id}`);
+        await ctx.writer.markFailed(parsed.id, "AI extraction returned no contracts");
+        return null;
+      }
+      logger.debug(
+        `AI extracted: ${aiExtraction.vulnerable_contracts.length} contracts`,
       );
     }
 
-    // Step 6: Build record
+    // Step 3: Resolve targets using AI extraction
+    const resolved = ctx.resolver.resolveTargets(
+      parsed,
+      aiExtraction?.vulnerable_contracts ?? null,
+    );
+
+    // Skip unsupported chains for free tier
+    const unsupportedChains = resolved.contracts
+      .map((c) => c.chain_id)
+      .filter((chainId) => !ctx.etherscanClient.isChainSupported(chainId));
+
+    if (unsupportedChains.length > 0 && config.etherscan_tier === "free") {
+      logger.info(
+        `Skipping ${parsed.id} - unsupported chain: ${[...new Set(unsupportedChains)].join(", ")}`,
+      );
+      return null;
+    }
+
+    // Step 4: Fetch contract data from Etherscan
+    const contracts = await ctx.fetcher.fetchContracts(resolved.contracts);
+    const status = ctx.fetcher.determineResolutionStatus(contracts);
+
+    // Build evidence
+    const evidence: string[] = [];
+    for (const c of contracts) {
+      if (c.is_verified) evidence.push(`verified: ${c.address}`);
+      else if (c.fetch_error)
+        evidence.push(`failed: ${c.address} (${c.fetch_error})`);
+      else evidence.push(`unverified: ${c.address}`);
+    }
+
+    // Step 5: AI Analyze with full context
+    let aiAnalysis = null;
+    if (ctx.aiClient.isEnabled() && status === "resolved") {
+      aiAnalysis = await ctx.aiClient.analyzeExploit(
+        parsed,
+        contracts,
+        aiExtraction,
+        ctx.foundryChains,
+      );
+      if (!aiAnalysis) {
+        logger.warn(`AI analysis failed for ${parsed.id}, continuing without it`);
+      }
+    }
+
     const record: DatasetRecord = {
       id: parsed.id,
       title: parsed.title,
       attack_title: parsed.attack_title,
       testcase: parsed.code,
-      resolution: {
-        status,
-        evidence,
-        resolved_at: new Date().toISOString(),
-      },
+      resolution: { status, evidence, resolved_at: new Date().toISOString() },
       contracts,
       ai_analysis: aiAnalysis ?? undefined,
       metadata: {
         poc_parser_version: ctx.parser.getVersion(),
-        dataset_version: '1.0.0',
+        dataset_version: "1.0.0",
         processed_at: new Date().toISOString(),
         ai_enabled: config.ai_enabled,
         ai_model: config.ai_model,
       },
     };
 
-    // Write idempotency key
     await ctx.writer.writeIdempotencyKey(idempotencyKey, {
       id: parsed.id,
       processed_at: new Date().toISOString(),
     });
 
-    const duration = Date.now() - startTime;
-    logger.info(`Processed ${parsed.id} in ${duration}ms [${status}]`);
-
+    logger.info(
+      `Processed ${parsed.id} in ${Date.now() - startTime}ms [${status}]`,
+    );
     return record;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error(`Failed to process ${filePath}: ${message}`);
+    logger.error(`Failed to process ${filePath}: ${error}`);
     return null;
   }
 }
 
 async function runPipeline() {
-  logger.info('='.repeat(60));
-  logger.info('Starting DeFi Vulnerability Dataset Pipeline');
-  logger.info('='.repeat(60));
+  logger.info("=".repeat(60));
+  logger.info("DeFi Vulnerability Dataset Pipeline");
+  logger.info("=".repeat(60));
 
   const ctx = await initializePipeline();
 
-  // Find POC files
   const pocFiles = await ctx.parser.findPOCFiles(config.input_dir);
-  logger.info(`Found ${pocFiles.length} POC files`);
-
-  // Apply test limit if set
-  const filesToProcess = config.test_limit 
+  const filesToProcess = config.test_limit
     ? pocFiles.slice(0, config.test_limit)
     : pocFiles;
 
-  logger.info(`Processing ${filesToProcess.length} files (limit: ${config.test_limit ?? 'none'})`);
+  logger.info(
+    `Found ${pocFiles.length} POCs, processing ${filesToProcess.length}`,
+  );
 
-  // Process files
-  let successCount = 0;
-  let skipCount = 0;
-  let unsupportedCount = 0;
+  const results: DatasetRecord[] = [];
+  const failed: string[] = [];
+
+  // Phase 1: Parse + AI Extract (fast, sequential to not overload AI)
+  const parsedResults: Array<{
+    parsed: any;
+    aiExtraction: any;
+    idempotencyKey: string;
+  }> = [];
 
   for (let i = 0; i < filesToProcess.length; i++) {
-    const filePath = filesToProcess[i];
-    
-    logger.info(`[${i + 1}/${filesToProcess.length}] Processing ${filePath}`);
-    
-    const record = await processPOC(ctx, filePath);
-    
-    if (record) {
-      await ctx.writer.writeRecord(record);
-      successCount++;
-    } else {
-      skipCount++;
-      // Check if it was skipped due to unsupported chain
-      const parsed = await ctx.parser.parsePOCFile(filePath);
-      const resolved = ctx.resolver.resolveTargets(parsed);
-      const unsupported = resolved.contracts
-        .map(c => c.chain_id)
-        .filter(chainId => !ctx.etherscanClient.isChainSupported(chainId));
-      if (unsupported.length > 0) {
-        unsupportedCount++;
+    try {
+      const parsed = await ctx.parser.parsePOCFile(filesToProcess[i]);
+      
+      const idempotencyKey = computeIdempotencyKey(
+        parsed.code,
+        ctx.parser.getVersion(),
+        config,
+      );
+      const alreadyProcessed = await ctx.writer.hasIdempotencyKey(idempotencyKey);
+      
+      if (alreadyProcessed && config.idempotency_strategy === "skip") {
+        logger.info(`Skipping ${parsed.id} (already processed)`);
+        continue;
       }
+
+      let aiExtraction = null;
+      if (ctx.aiClient.isEnabled()) {
+        aiExtraction = await ctx.aiClient.extractContractInfo(parsed, ctx.foundryChains);
+        if (!aiExtraction?.vulnerable_contracts?.length) {
+          logger.error(`AI extraction failed for ${parsed.id}`);
+          failed.push(parsed.id);
+          continue;
+        }
+      }
+
+      parsedResults.push({ parsed, aiExtraction, idempotencyKey });
+      
+      if ((i + 1) % 10 === 0) {
+        logger.info(`Phase 1 Progress: ${i + 1}/${filesToProcess.length} parsed`);
+      }
+    } catch (error) {
+      logger.error(`Failed to parse ${filesToProcess[i]}: ${error}`);
     }
   }
 
-  // Finalize
-  await ctx.writer.finalize();
+  logger.info(`Phase 1 complete: ${parsedResults.length} ready for fetching`);
 
-  const manifest = ctx.writer.getManifest();
+  // Phase 2: Fetch contracts + AI Analyze (parallel)
+  for (let i = 0; i < parsedResults.length; i++) {
+    const { parsed, aiExtraction, idempotencyKey } = parsedResults[i];
+    
+    try {
+      const resolved = ctx.resolver.resolveTargets(parsed, aiExtraction?.vulnerable_contracts ?? null);
+      
+      const unsupportedChains = resolved.contracts
+        .map((c: any) => c.chain_id)
+        .filter((chainId: number) => !ctx.etherscanClient.isChainSupported(chainId));
+      
+      if (unsupportedChains.length > 0 && config.etherscan_tier === "free") {
+        logger.info(`Skipping ${parsed.id} - unsupported chain`);
+        failed.push(parsed.id);
+        continue;
+      }
 
-  logger.info('='.repeat(60));
-  logger.info('Pipeline Complete');
-  logger.info(`Total: ${filesToProcess.length}`);
-  logger.info(`Success: ${successCount}`);
-  logger.info(`Skipped (already processed): ${skipCount - unsupportedCount}`);
-  logger.info(`Skipped (unsupported chain): ${unsupportedCount}`);
-  logger.info(`Failed: ${manifest.failed_ids.length}`);
-  logger.info(`Batches: ${manifest.total_batches}`);
-  logger.info('='.repeat(60));
+      const contracts = await ctx.fetcher.fetchContracts(resolved.contracts);
+      const status = ctx.fetcher.determineResolutionStatus(contracts);
+
+      const evidence: string[] = [];
+      for (const c of contracts) {
+        if (c.is_verified) evidence.push(`verified: ${c.address}`);
+        else if (c.fetch_error) evidence.push(`failed: ${c.address} (${c.fetch_error})`);
+        else evidence.push(`unverified: ${c.address}`);
+      }
+
+      // AI Analyze (if resolved)
+      let aiAnalysis = null;
+      if (ctx.aiClient.isEnabled() && status === "resolved") {
+        aiAnalysis = await ctx.aiClient.analyzeExploit(parsed, contracts, aiExtraction, ctx.foundryChains);
+      }
+
+      const record: DatasetRecord = {
+        id: parsed.id,
+        title: parsed.title,
+        attack_title: parsed.attack_title,
+        testcase: parsed.code,
+        resolution: { status, evidence, resolved_at: new Date().toISOString() },
+        contracts,
+        ai_analysis: aiAnalysis ?? undefined,
+        metadata: {
+          poc_parser_version: ctx.parser.getVersion(),
+          dataset_version: "1.0.0",
+          processed_at: new Date().toISOString(),
+          ai_enabled: config.ai_enabled,
+          ai_model: config.ai_model,
+        },
+      };
+
+      await ctx.writer.writeIdempotencyKey(idempotencyKey, { id: parsed.id, processed_at: new Date().toISOString() });
+      results.push(record);
+      
+      if ((i + 1) % 10 === 0) {
+        logger.info(`Phase 2 Progress: ${i + 1}/${parsedResults.length} fetched`);
+      }
+    } catch (error) {
+      logger.error(`Failed to process ${parsed.id}: ${error}`);
+      failed.push(parsed.id);
+    }
+  }
+
+  await ctx.writer.finalize(results, failed);
+
+  logger.info("=".repeat(60));
+  logger.info(
+    `Done: ${results.length} success, ${failed.length} failed`,
+  );
+  logger.info("=".repeat(60));
 }
 
-// Run the pipeline
 runPipeline().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  logger.error('Pipeline failed', message);
+  logger.error("Pipeline failed", error);
   process.exit(1);
 });
