@@ -1,0 +1,10 @@
+{
+  "generated_at": "2026-04-10T07:57:43.062Z",
+  "dataset_records": 698,
+  "compact_pocs": 700,
+  "compact_contracts": 959,
+  "compact_source_files": 5857,
+  "compact_unique_blobs": 3737,
+  "compact_blob_bytes": 23684245,
+  "pruned": true
+}

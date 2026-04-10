@@ -17,7 +17,17 @@ export class TargetResolver {
     poc: ParsedPOC,
     aiContracts: AIExtractedContract[] | null = null,
   ): TargetResolutionResult {
-    const candidates: TargetResolutionResult["candidates"] = [];
+    type Candidate = {
+      address: string;
+      chain_id: number;
+      chain_name: string;
+      confidence: number;
+      evidence: string;
+      role: "vulnerable" | "attacker" | "helper" | "unknown";
+      source_hint: string;
+    };
+
+    const candidates: Candidate[] = [];
     const resolved: TargetResolutionResult["contracts"] = [];
 
     // First, use AI-extracted contracts if available (higher confidence)
@@ -109,7 +119,7 @@ export class TargetResolver {
 
     // Determine source
     const source = aiContracts
-      ? "ai_extraction"
+      ? "manual"
       : poc.raw_addresses.some((a) => a.source.startsWith("comment"))
         ? "header"
         : poc.raw_addresses.some((a) => a.source === "code_match")
@@ -120,7 +130,12 @@ export class TargetResolver {
       contracts: resolved,
       confidence: avgConfidence,
       source,
-      candidates: candidates,
+      candidates: candidates.map((candidate) => ({
+        address: candidate.address,
+        chain_id: candidate.chain_id,
+        confidence: candidate.confidence,
+        evidence: candidate.evidence,
+      })),
       resolution_status,
     };
   }

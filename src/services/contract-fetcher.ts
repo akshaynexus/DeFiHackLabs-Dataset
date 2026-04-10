@@ -1,18 +1,16 @@
 import { getChainConfig } from "../domain/chain";
 import { createDefaultProxy } from "../domain/vulnerability";
-import { type Result, ok, err, isOk } from "../lib/result";
+import { type Result, type FetchError, ok, err, isOk } from "../lib/result";
 import { logger } from "../lib/logger";
 import { FileCache } from "../lib/cache";
-import {
-  EtherscanClient,
-  type EtherscanClient,
-} from "../clients/etherscan-client";
+import { EtherscanClient } from "../clients/etherscan-client";
 import type { Config } from "../config/env";
 import type {
   ResolvedContract,
-  FetchError,
   ResolutionStatus,
 } from "../domain/vulnerability";
+import { readFile } from "fs/promises";
+import { isAbsolute, join, relative } from "path";
 
 export interface ContractFetcherOptions {
   etherscanClient: EtherscanClient;
@@ -25,10 +23,34 @@ export interface ContractWithImplementation {
   implementation: ResolvedContract | null;
 }
 
+interface LocalContractArtifactEntry {
+  address: string;
+  chainId: number;
+  role: "vulnerable" | "attacker" | "helper" | "unknown";
+  chainName: string;
+  contractName: string | null;
+  verificationStatus: string;
+  sourceFiles: string[];
+  artifactDir: string;
+}
+
+interface CachedContractData {
+  sourceCode: string | null;
+  abi: string | null;
+  bytecode: string | null;
+  isVerified: boolean;
+  contractName: string | null;
+  compilerVersion: string | null;
+  isProxy: boolean;
+  implementationAddress: string | null;
+}
+
 export class ContractFetcher {
   private client: EtherscanClient;
   private cache: FileCache;
   private config: Config;
+  private localArtifactsIndexPromise: Promise<Map<string, LocalContractArtifactEntry>> | null =
+    null;
 
   constructor(options: ContractFetcherOptions) {
     this.client = options.etherscanClient;
@@ -47,36 +69,85 @@ export class ContractFetcher {
     }>,
   ): Promise<ResolvedContract[]> {
     const results: ResolvedContract[] = [];
+    const uniqueContracts = this.deduplicateContracts(contracts);
 
-    // Fetch in parallel with limit
-    const chunkSize = this.config.fetch_parallel;
+    if (uniqueContracts.length !== contracts.length) {
+      logger.debug(
+        `Deduplicated ${contracts.length - uniqueContracts.length} duplicate contract targets`,
+      );
+    }
 
-    for (let i = 0; i < contracts.length; i += chunkSize) {
-      const chunk = contracts.slice(i, i + chunkSize);
+    const chunkSize = Math.max(1, this.config.fetch_parallel);
 
-      const fetches = chunk.map(async (c) => {
-        const result = await this.fetchSingleContractWithProxy(c);
-        return { input: c, result };
+    for (let i = 0; i < uniqueContracts.length; i += chunkSize) {
+      const chunk = uniqueContracts.slice(i, i + chunkSize);
+
+      const fetches = chunk.map(async (contract) => {
+        const result = await this.fetchSingleContractWithProxy(contract);
+        return { input: contract, result };
       });
 
-      const responses = await Promise.all(fetches);
+      const responses = await Promise.allSettled(fetches);
 
-      for (const { input, result } of responses) {
+      for (const [j, settled] of responses.entries()) {
+        const input = chunk[j];
+        if (!input) continue;
+
+        if (settled.status === "rejected") {
+          logger.warn(
+            `Unexpected fetch failure for ${input.address}: ${String(settled.reason)}`,
+          );
+          results.push(
+            this.createFailedContract(input, {
+              type: "api_error",
+              code: "FETCH_CRASH",
+              message: String(settled.reason),
+            }),
+          );
+          continue;
+        }
+
+        const { result } = settled.value;
         if (isOk(result)) {
-          // Add the proxy contract
           results.push(result.data.proxy);
-          // Add the implementation contract if it exists and is different
           if (result.data.implementation) {
             results.push(result.data.implementation);
           }
-        } else {
-          // Add contract with error info
-          results.push(this.createFailedContract(input, result.error));
+          continue;
         }
+
+        results.push(this.createFailedContract(input, result.error));
       }
     }
 
     return results;
+  }
+
+  private deduplicateContracts(
+    contracts: Array<{
+      address: string;
+      role: "vulnerable" | "attacker" | "helper" | "unknown";
+      chain_id: number;
+      chain_name: string;
+      source_hint: string;
+      confidence: number;
+    }>,
+  ) {
+    const deduped = new Map<string, (typeof contracts)[number]>();
+
+    for (const contract of contracts) {
+      const normalizedAddress = contract.address.toLowerCase();
+      const key = `${contract.chain_id}:${normalizedAddress}`;
+      const existing = deduped.get(key);
+      if (!existing || existing.confidence < contract.confidence) {
+        deduped.set(key, {
+          ...contract,
+          address: normalizedAddress,
+        });
+      }
+    }
+
+    return Array.from(deduped.values());
   }
 
   private async fetchSingleContractWithProxy(contract: {
@@ -197,43 +268,38 @@ export class ContractFetcher {
     chain_id: number;
     chain_name: string;
     source_hint: string;
-  }): Promise<
-    Result<
-      {
-        sourceCode: string | null;
-        abi: string | null;
-        bytecode: string | null;
-        isVerified: boolean;
-        contractName: string | null;
-        compilerVersion: string | null;
-        isProxy: boolean;
-        implementationAddress: string | null;
-      },
-      FetchError
-    >
-  > {
+  }): Promise<Result<CachedContractData, FetchError>> {
     const cacheKey = `contract_${contract.chain_id}_${contract.address}`;
+
+    const localArtifact = await this.getLocalContractFromArtifacts(
+      contract.chain_id,
+      contract.address,
+    );
+    if (localArtifact && (localArtifact.sourceCode || localArtifact.bytecode)) {
+      if (this.config.cache_enabled) {
+        await this.cache.set(cacheKey, localArtifact);
+      }
+      logger.debug(`Local artifact hit for ${contract.address}`);
+      return ok(localArtifact, true);
+    }
 
     // Check cache first
     if (this.config.cache_enabled) {
-      const cached = await this.cache.get<{
-        sourceCode: string | null;
-        abi: string | null;
-        bytecode: string | null;
-        isVerified: boolean;
-        contractName: string | null;
-        compilerVersion: string | null;
-        isProxy: boolean;
-        implementationAddress: string | null;
-      }>(cacheKey);
+      const cached = await this.cache.get<CachedContractData>(cacheKey);
 
       if (cached) {
-        logger.debug(`Cache hit for ${contract.address}`);
-        return ok(cached, true);
+        if (!cached.sourceCode && !cached.bytecode) {
+          logger.debug(
+            `Cache entry without source/bytecode for ${contract.address}; retrying fetch`,
+          );
+        } else {
+          logger.debug(`Cache hit for ${contract.address}`);
+          return ok(cached, true);
+        }
       }
     }
 
-    // Fetch from Etherscan
+    // Fetch from Etherscan only if source/bytecode still unavailable locally.
     const dataResult = await this.client.getContractData(
       contract.address,
       contract.chain_id,
@@ -245,7 +311,7 @@ export class ContractFetcher {
 
     const data = dataResult.data;
 
-    const result = {
+    const result: CachedContractData = {
       sourceCode: data.sourceCode,
       abi: data.abi,
       bytecode: data.bytecode,
@@ -262,6 +328,182 @@ export class ContractFetcher {
     }
 
     return ok(result);
+  }
+
+  private async getLocalContractFromArtifacts(
+    chainId: number,
+    address: string,
+  ): Promise<CachedContractData | null> {
+    const index = await this.loadLocalArtifactsIndex();
+    const key = `${chainId}:${address.toLowerCase()}`;
+    const entry = index.get(key);
+    if (!entry) {
+      return null;
+    }
+
+    const sourceUnits: Array<{ path: string; content: string }> = [];
+    let bytecode: string | null = null;
+
+    for (const sourceFile of entry.sourceFiles) {
+      const normalized = sourceFile.replace(/\\/g, "/");
+      if (normalized.endsWith("/NO_SOURCE.txt") || normalized.endsWith("NO_SOURCE.txt")) {
+        continue;
+      }
+      if (normalized.endsWith("/bytecode.txt") || normalized.endsWith("bytecode.txt")) {
+        const bytecodeRaw = await this.readTextIfExists(sourceFile);
+        const trimmed = bytecodeRaw?.trim();
+        if (trimmed && trimmed.length > 0) {
+          bytecode = trimmed;
+        }
+        continue;
+      }
+      if (!normalized.endsWith(".sol")) {
+        continue;
+      }
+
+      const content = await this.readTextIfExists(sourceFile);
+      if (!content || content.trim().length === 0) {
+        continue;
+      }
+      sourceUnits.push({
+        path: this.toPosixPath(relative(entry.artifactDir, sourceFile)),
+        content,
+      });
+    }
+
+    if (sourceUnits.length === 0 && !bytecode) {
+      return null;
+    }
+
+    const sourceCode =
+      sourceUnits.length === 0
+        ? null
+        : sourceUnits.length === 1 && sourceUnits[0]
+          ? sourceUnits[0].content
+          : JSON.stringify({
+              sources: Object.fromEntries(
+                sourceUnits.map((unit) => [unit.path, { content: unit.content }]),
+              ),
+            });
+
+    return {
+      sourceCode,
+      abi: null,
+      bytecode,
+      isVerified:
+        sourceUnits.length > 0 ||
+        entry.verificationStatus === "verified" ||
+        entry.verificationStatus === "proxy",
+      contractName: entry.contractName,
+      compilerVersion: null,
+      isProxy: entry.verificationStatus === "proxy",
+      implementationAddress: null,
+    };
+  }
+
+  private async loadLocalArtifactsIndex(): Promise<Map<string, LocalContractArtifactEntry>> {
+    if (!this.localArtifactsIndexPromise) {
+      this.localArtifactsIndexPromise = this.buildLocalArtifactsIndex();
+    }
+    return await this.localArtifactsIndexPromise;
+  }
+
+  private async buildLocalArtifactsIndex(): Promise<Map<string, LocalContractArtifactEntry>> {
+    const index = new Map<string, LocalContractArtifactEntry>();
+    const manifestPath = join(this.config.contracts_dir, "manifest.json");
+
+    try {
+      const raw = await readFile(manifestPath, "utf-8");
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object") {
+        return index;
+      }
+
+      const pocs = (parsed as { pocs?: unknown[] }).pocs;
+      if (!Array.isArray(pocs)) {
+        return index;
+      }
+
+      for (const poc of pocs) {
+        if (!poc || typeof poc !== "object") continue;
+        const contracts = (poc as { contracts?: unknown[] }).contracts;
+        if (!Array.isArray(contracts)) continue;
+
+        for (const contract of contracts) {
+          if (!contract || typeof contract !== "object") continue;
+          const input = contract as {
+            address?: unknown;
+            chain_id?: unknown;
+            chain_name?: unknown;
+            role?: unknown;
+            contract_name?: unknown;
+            verification_status?: unknown;
+            source_files?: unknown;
+            artifact_dir?: unknown;
+          };
+          if (
+            typeof input.address !== "string" ||
+            typeof input.chain_id !== "number" ||
+            typeof input.artifact_dir !== "string" ||
+            !Array.isArray(input.source_files)
+          ) {
+            continue;
+          }
+
+          const resolvedSourceFiles = input.source_files
+            .filter((file): file is string => typeof file === "string")
+            .map((file) => this.resolvePath(file));
+          const artifactDir = this.resolvePath(input.artifact_dir);
+          const key = `${input.chain_id}:${input.address.toLowerCase()}`;
+
+          index.set(key, {
+            address: input.address.toLowerCase(),
+            chainId: input.chain_id,
+            role: this.normalizeRole(input.role),
+            chainName: typeof input.chain_name === "string" ? input.chain_name : "",
+            contractName: typeof input.contract_name === "string" ? input.contract_name : null,
+            verificationStatus:
+              typeof input.verification_status === "string"
+                ? input.verification_status
+                : "not_found",
+            sourceFiles: resolvedSourceFiles,
+            artifactDir,
+          });
+        }
+      }
+    } catch {
+      return index;
+    }
+
+    return index;
+  }
+
+  private resolvePath(pathLike: string): string {
+    if (isAbsolute(pathLike)) {
+      return pathLike;
+    }
+    return join(process.cwd(), pathLike);
+  }
+
+  private toPosixPath(path: string): string {
+    return path.replace(/\\/g, "/");
+  }
+
+  private normalizeRole(
+    role: unknown,
+  ): "vulnerable" | "attacker" | "helper" | "unknown" {
+    if (role === "vulnerable" || role === "attacker" || role === "helper") {
+      return role;
+    }
+    return "unknown";
+  }
+
+  private async readTextIfExists(path: string): Promise<string | null> {
+    try {
+      return await readFile(path, "utf-8");
+    } catch {
+      return null;
+    }
   }
 
   private async fetchSingleContract(contract: {

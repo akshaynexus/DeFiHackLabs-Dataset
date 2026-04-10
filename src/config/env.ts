@@ -8,6 +8,7 @@ export interface Config {
   ai_extraction_model: string;
   ai_analysis_model: string;
   ai_enabled: boolean;
+  ai_enable_mitigation: boolean;
   ai_temperature: number;
 
   // Etherscan
@@ -20,6 +21,7 @@ export interface Config {
   rate_limit_rps: number;
 
   // Concurrency
+  pipeline_parallel: number;
   fetch_parallel: number;
   ai_parallel: number;
   ai_delay_ms: number;
@@ -27,6 +29,7 @@ export interface Config {
   // Output
   input_dir: string;
   output_dir: string;
+  contracts_dir: string;
   cache_dir: string;
   idempotency_dir: string;
   chunk_size: number;
@@ -118,6 +121,7 @@ export const config: Config = {
   ai_extraction_model: extraction.effective_model,
   ai_analysis_model: analysis.effective_model,
   ai_enabled: getEnvBool("AI_ENABLED", false),
+  ai_enable_mitigation: getEnvBool("AI_ENABLE_MITIGATION", true),
   ai_temperature: getEnvNum("AI_TEMPERATURE", 0.3),
 
   // Etherscan
@@ -130,6 +134,7 @@ export const config: Config = {
   rate_limit_rps: getEnvNum("RATE_LIMIT_RPS", 5),
 
   // Concurrency
+  pipeline_parallel: getEnvNum("PIPELINE_PARALLEL", 6),
   fetch_parallel: getEnvNum("FETCH_PARALLEL", 5),
   ai_parallel: getEnvNum("AI_PARALLEL", 1),
   ai_delay_ms: getEnvNum("AI_DELAY_MS", 1000),
@@ -137,6 +142,7 @@ export const config: Config = {
   // Output
   input_dir: getEnv("INPUT_DIR", "./data/input/DeFiHackLabs/src/test"),
   output_dir: getEnv("OUTPUT_DIR", "./data/output"),
+  contracts_dir: getEnv("CONTRACTS_DIR", "./data/contracts"),
   cache_dir: getEnv("CACHE_DIR", "./data/cache"),
   idempotency_dir: getEnv("IDEMPOTENCY_DIR", "./data/cache/idempotency"),
   chunk_size: getEnvNum("CHUNK_SIZE", 100),

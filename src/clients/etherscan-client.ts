@@ -1,5 +1,5 @@
 import { ok, err, type Result, type FetchError } from "../lib/result";
-import { defaultRateLimiter } from "../lib/rate-limit";
+import { MultiRateLimiter } from "../lib/rate-limit";
 import { asyncRetry } from "../lib/retry";
 
 export interface EtherscanSourceCodeResponse {
@@ -60,9 +60,9 @@ const V2_BASE_URL = "https://api.etherscan.io/v2/api";
 export class EtherscanClient {
   private apiKey: string;
   private tier: ApiTier;
-  private rateLimiter = defaultRateLimiter;
+  private rateLimiter: MultiRateLimiter;
 
-  constructor(apiKey: string, tier: ApiTier = "free") {
+  constructor(apiKey: string, tier: ApiTier = "free", rateLimitRps = 5) {
     if (!apiKey || apiKey === "YourApiKeyToken") {
       throw new Error(
         "ETHERSCAN_API_KEY is required. Get one from https://etherscan.io/apis",
@@ -70,6 +70,11 @@ export class EtherscanClient {
     }
     this.apiKey = apiKey;
     this.tier = tier;
+    const safeRps = Math.max(1, rateLimitRps);
+    this.rateLimiter = new MultiRateLimiter({
+      rps: safeRps,
+      maxBurst: Math.max(2, safeRps * 2),
+    });
   }
 
   isChainSupported(chainId: number): boolean {
@@ -213,14 +218,15 @@ export class EtherscanClient {
       result: EtherscanSourceCodeResponse[];
     };
 
-    if (data.status !== "1" || !data.result || data.result.length === 0) {
+    const firstResult = data.result?.[0];
+    if (data.status !== "1" || !firstResult) {
       return err({
         type: "not_found",
         reason: "no_contract",
       } as FetchError);
     }
 
-    return ok(data.result[0], false);
+    return ok(firstResult, false);
   }
 
   async getAbi(
@@ -341,6 +347,7 @@ export class EtherscanClient {
 export function createEtherscanClient(
   apiKey: string,
   tier: ApiTier = "free",
+  rateLimitRps = 5,
 ): EtherscanClient {
-  return new EtherscanClient(apiKey, tier);
+  return new EtherscanClient(apiKey, tier, rateLimitRps);
 }

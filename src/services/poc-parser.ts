@@ -1,5 +1,5 @@
 import { readdir, readFile } from "fs/promises";
-import { basename, relative } from "path";
+import { basename, dirname, relative } from "path";
 import { logger } from "../lib/logger";
 import type { ParsedPOC } from "../domain/vulnerability";
 
@@ -55,13 +55,15 @@ export class POCParser {
       const lower = line.toLowerCase();
       if (lower.includes("title") || lower.includes("name")) {
         const match = line.match(/\/\/\s*(?:title|name)[:\s]*([^\n]+)/i);
-        if (match) title = match[1].trim();
+        const extracted = match?.[1]?.trim();
+        if (extracted) title = extracted;
       }
       if (lower.includes("attack") || lower.includes("vulnerability")) {
         const match = line.match(
           /\/\/\s*(?:attack|vulnerability)[:\s]*([^\n]+)/i,
         );
-        if (match) attack_title = match[1].trim();
+        const extracted = match?.[1]?.trim();
+        if (extracted) attack_title = extracted;
       }
     }
 
@@ -73,10 +75,20 @@ export class POCParser {
   }
 
   private generateId(filePath: string): string {
-    return basename(filePath, ".sol")
+    const baseId = basename(filePath, ".sol")
       .replace(/_exp$/, "")
       .toLowerCase()
       .replace(/[^a-z0-9]/g, "_");
+
+    const parentId = basename(dirname(filePath))
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "_");
+
+    if (!parentId || parentId === "test") {
+      return baseId;
+    }
+
+    return `${parentId}_${baseId}`.replace(/_+/g, "_").replace(/^_|_$/g, "");
   }
 
   getVersion(): string {
