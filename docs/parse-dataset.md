@@ -1,74 +1,117 @@
-# Parse Dataset Output
+# Dataset Parsing Guide
 
-This guide explains the output files and how to query them quickly.
+This document is for:
 
-## Files You Will Use
+- users who want to understand the incident pipeline end-to-end
+- data pullers preparing training corpora for AI models
 
-- `data/output/dataset.json`: main incident dataset
-- `data/output/manifest.json`: run metadata
-- `data/contracts/manifest.json`: contract artifact index
-- `data/contracts/contracts.compact.json`: compact contract blob format (if generated)
+---
 
-## `dataset.json` Structure
+## 1) What the pipeline does
 
-Top-level shape:
+For each PoC test file, the pipeline does:
+
+1. Parse PoC metadata and code.
+2. Extract candidate contracts (AI first, fallback heuristics).
+3. Resolve chain/address targets.
+4. Fetch contract source, ABI, and bytecode (local artifacts/cache first, explorer fallback).
+5. Run exploit analysis (`ai_analysis`) if AI is enabled and request succeeds.
+6. Write normalized dataset records + contract artifacts.
+
+Primary output: `data/output/dataset.json`
+
+---
+
+## 2) Source and provenance model
+
+Each record is built from multiple sources:
+
+- **PoC source**: raw Solidity test file (`poc_code`)
+- **Contract resolution**: explorer APIs + local artifact cache
+- **AI extraction**: identifies likely vulnerable/attacker/helper contracts
+- **AI analysis**: explanation, root cause, steps, type, confidence
+
+Trust model you should use for training:
+
+- `poc_code` and resolved contract metadata are deterministic pipeline output.
+- `ai_analysis` is model-generated and should be treated as weak/soft labels.
+- `resolution.evidence` explains why a record is partial/failed/resolved.
+
+---
+
+## 3) `dataset.json` layout
+
+Top level:
 
 ```json
 {
   "version": "3.0.0",
-  "generated_at": "2026-04-10T06:22:29.139Z",
-  "total_records": 20,
+  "generated_at": "...",
+  "total_records": 698,
   "failed_ids": [],
   "records": []
 }
 ```
 
-During long runs, checkpoint writes may include:
+During a long run, temporary checkpoints may include:
 
-```json
-{
-  "in_progress": true,
-  "progress": {
-    "total": 698,
-    "processed": 120,
-    "success": 118,
-    "failed": 1,
-    "skipped": 1,
-    "analyzed": 80
-  }
-}
-```
+- `in_progress: true`
+- `progress: { total, processed, success, failed, skipped, analyzed }`
 
-### Record shape (`records[]`)
+Final file keeps the standard top-level dataset shape.
 
-Each record contains:
+---
+
+## 4) Record schema (`records[]`)
+
+Main fields:
 
 - `id`: stable incident ID
 - `title`, `attack_title`
-- `poc_code`: raw PoC Solidity test code
-- `resolution`: status + evidence
-- `contracts_dir`: where expanded files are stored
-- `contracts[]`: normalized contract metadata
-- `ai_analysis` (optional): analysis payload when AI succeeded
-- `metadata`: parser/model/timestamp details
+- `poc_code`: raw test/PoC source
+- `resolution`: status + evidence trail
+- `contracts_dir`: expanded artifact directory
+- `contracts[]`: normalized contract entries
+- `ai_analysis` (optional)
+- `metadata`: parser/model/time info
 
-## Contract Object (`records[].contracts[]`)
+### `resolution.status` (important)
 
-Key fields:
+Typical statuses:
+
+- `resolved`: contracts resolved, no fetch errors
+- `partial`: some verified, some not
+- `fetch_failed`: explorer/network failures for at least one contract
+- `unverified_contract`: no verified source found
+- `chain_unsupported`: chain unavailable on current API tier
+- `parse_failed`: extraction/parse did not produce usable targets
+
+Use status filtering for training set quality control.
+
+---
+
+## 5) Contract schema (`records[].contracts[]`)
+
+Each contract includes:
 
 - identity: `address`, `role`
 - chain: `chain.id`, `chain.name`
 - verification: `verification_status`, `is_verified`
-- availability: `source_available`, `abi_available`, `bytecode_available`
+- availability:
+  - `source_available`
+  - `abi_available`
+  - `bytecode_available`
 - diagnostics: `fetch_error`
-- artifacts: `artifact_dir`, `source_files[]`
+- artifact pointers: `artifact_dir`, `source_files[]`
 
-If source is missing, `source_files` usually contains:
+If source is unavailable:
 
-- `NO_SOURCE.txt`
-- `bytecode.txt` (when bytecode was available)
+- `NO_SOURCE.txt` is written
+- `bytecode.txt` is written when bytecode exists
 
-## `ai_analysis` Object
+---
+
+## 6) `ai_analysis` schema
 
 When present:
 
@@ -76,38 +119,67 @@ When present:
 - `root_cause`
 - `attack_steps[]`
 - `vulnerability_type`
-- `confidence`
-- `mitigation[]` (only when mitigation is enabled)
+- `confidence` (score + factors + reasoning)
+- `mitigation[]` (only if mitigation generation is enabled)
 
-If `ai_analysis` is null/missing, the record was parsed but AI analysis failed or was disabled.
+If `ai_analysis` is missing/null, analysis failed or was disabled.
 
-## Useful `jq` Queries
+---
 
-### 1) Total incidents
+## 7) How to build training datasets
+
+Recommended minimum-quality slice:
+
+- keep records where:
+  - `resolution.status` in `["resolved", "partial"]`
+  - `ai_analysis != null`
+  - at least one contract has `source_available == true`
+
+Broader slice (include bytecode-only incidents):
+
+- include records with `bytecode_available == true` even when source is missing
+- keep `resolution.evidence` and `fetch_error` as quality/context features
+
+Suggested supervised row format:
+
+- Input:
+  - `poc_code`
+  - resolved contracts (address/role/chain/source-or-bytecode availability)
+  - optional inlined source/bytecode from artifact files
+- Labels:
+  - `ai_analysis.vulnerability_type`
+  - `ai_analysis.root_cause`
+  - `ai_analysis.attack_steps`
+
+---
+
+## 8) `jq` queries for data pullers
+
+Total incidents:
 
 ```bash
 jq '.total_records' data/output/dataset.json
 ```
 
-### 2) How many have AI analysis
+Incidents with analysis:
 
 ```bash
 jq '[.records[] | select(.ai_analysis != null)] | length' data/output/dataset.json
 ```
 
-### 3) IDs without AI analysis
+High-quality training IDs:
 
 ```bash
-jq -r '.records[] | select(.ai_analysis == null) | .id' data/output/dataset.json
+jq -r '
+  .records[]
+  | select(.ai_analysis != null)
+  | select(.resolution.status == "resolved" or .resolution.status == "partial")
+  | select(any(.contracts[]; .source_available == true))
+  | .id
+' data/output/dataset.json
 ```
 
-### 4) Count by resolution status
-
-```bash
-jq -r '.records[].resolution.status' data/output/dataset.json | sort | uniq -c
-```
-
-### 5) Contracts with no source but bytecode present
+Incidents with bytecode-only contracts:
 
 ```bash
 jq -r '
@@ -119,34 +191,19 @@ jq -r '
 ' data/output/dataset.json
 ```
 
-### 6) Incidents by chain
+Count by resolution status:
 
 ```bash
-jq -r '
-  .records[]
-  | .contracts[]
-  | .chain.name
-' data/output/dataset.json | sort | uniq -c | sort -nr
+jq -r '.records[].resolution.status' data/output/dataset.json | sort | uniq -c
 ```
 
-## `data/contracts/manifest.json`
+---
 
-Use this when you want direct mapping from incident -> contract -> artifact files.
+## 9) Contract artifact indexes
 
-It is the index for expanded contract files and includes:
+Use these for joining records to raw files:
 
-- `pocs[]`
-  - `id`, `contracts_dir`
-  - `contracts[]`
-    - `address`, `chain_id`, `verification_status`
-    - `artifact_dir`, `source_files[]`
+- `data/contracts/manifest.json`: expanded filesystem index
+- `data/contracts/contracts.compact.json`: compact deduplicated blob format
 
-## Compact Contracts File (`contracts.compact.json`)
-
-If you run compaction, this file stores contract source/bytecode in a deduplicated blob format:
-
-- `pocs[]` references files by `blob_id`
-- `blobs[]` contains full text content once per unique hash
-
-This is useful for low file churn in CI and Git workflows.
-
+`contracts.compact.json` is best for model pipelines that want fewer filesystem operations.

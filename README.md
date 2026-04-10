@@ -1,19 +1,22 @@
 # DeFiHackLabs Dataset Pipeline
 
-Generate a structured exploit dataset from DeFiHackLabs PoC tests, resolve contract data, and run optional AI extraction/analysis.
+Builds a machine-readable exploit dataset from DeFiHackLabs PoC tests.
 
-## Quick Start
+## Quickstart
 
 ```bash
 bun install
 cp .env.example .env
 ```
 
-Set required values in `.env`:
+Set required `.env` values:
 
 - `ETHERSCAN_API_KEY`
-- `AI_ENABLED=true` (if using AI)
-- provider key for your model (`GEMINI_API_KEY`, `OPENROUTER_API_KEY`, or `CROF_API_KEY`)
+- `AI_ENABLED=true` (optional, but recommended for labels)
+- one provider key matching your model:
+  - `GEMINI_API_KEY`
+  - `OPENROUTER_API_KEY`
+  - `CROF_API_KEY`
 
 Run:
 
@@ -21,33 +24,19 @@ Run:
 bun run start
 ```
 
-## Output Files
+## Output
 
-- `data/output/dataset.json`: main dataset
-- `data/output/manifest.json`: run metadata/progress snapshot
-- `data/contracts/manifest.json`: contract artifacts index
-- `data/contracts/<incident-id>/...`: expanded source/bytecode artifacts
+- `data/output/dataset.json` - final training-ready incident records
+- `data/output/manifest.json` - run metadata and progress snapshots
+- `data/contracts/manifest.json` - index of contract artifact files
+- `data/contracts/<incident-id>/...` - expanded contract source/bytecode files
 
-Detailed parsing guide: [docs/parse-dataset.md](/Users/akshaycm/Documents/GitRepos/DeFiHackLabs-Dataset/docs/parse-dataset.md)
+## Docs
 
-## Compaction (Reduce File Churn)
-
-Create compact contracts data:
-
-```bash
-bun run compact:data
-```
-
-Create compact data and prune expanded/cache files:
-
-```bash
-bun run compact:data:prune
-```
-
-Compaction outputs:
-
-- `data/contracts/contracts.compact.json`
-- `data/output/compact-summary.json`
+- Dataset structure + parsing: `docs/parse-dataset.md`
+- Compaction flow:
+  - `bun run compact:data`
+  - `bun run compact:data:prune`
 
 ## Common Toggles
 
@@ -55,4 +44,3 @@ Compaction outputs:
 - `AI_ENABLE_MITIGATION=true|false`
 - `TEST_LIMIT=<n>`
 - `PIPELINE_PARALLEL`, `FETCH_PARALLEL`, `AI_PARALLEL`
-
